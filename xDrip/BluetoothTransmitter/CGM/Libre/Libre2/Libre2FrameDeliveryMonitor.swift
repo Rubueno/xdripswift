@@ -20,6 +20,19 @@ struct Libre2FrameAssembler {
         case oversized(receivedByteCount: Int)
     }
 
+    struct TimedOutPartialFrame: Equatable {
+        let discardedByteCount: Int
+        let assemblyDuration: TimeInterval
+    }
+
+    /// Reports frame assembly and any timeout that occurred while accepting the new fragment.
+    /// Keeping both results means the fragment that reveals a timeout can immediately become the
+    /// first fragment of the next frame instead of being thrown away for diagnostic convenience.
+    struct AppendResult: Equatable {
+        let frameResult: Result
+        let timedOutPartialFrame: TimedOutPartialFrame?
+    }
+
     private let expectedByteCount: Int
     private let assemblyTimeout: Duration
 
@@ -31,10 +44,16 @@ struct Libre2FrameAssembler {
         self.assemblyTimeout = assemblyTimeout
     }
 
-    mutating func append(_ fragment: Data, arrival: ContinuousClock.Instant) -> Result {
+    mutating func append(_ fragment: Data, arrival: ContinuousClock.Instant) -> AppendResult {
+        var timedOutPartialFrame: TimedOutPartialFrame?
+
         if let firstFragmentArrival,
            firstFragmentArrival.duration(to: arrival) > assemblyTimeout
         {
+            timedOutPartialFrame = TimedOutPartialFrame(
+                discardedByteCount: buffer.count,
+                assemblyDuration: firstFragmentArrival.duration(to: arrival).timeInterval
+            )
             reset()
         }
 
@@ -45,20 +64,26 @@ struct Libre2FrameAssembler {
         buffer.append(fragment)
 
         guard buffer.count >= expectedByteCount else {
-            return .incomplete
+            return AppendResult(frameResult: .incomplete, timedOutPartialFrame: timedOutPartialFrame)
         }
 
         guard buffer.count == expectedByteCount else {
             let receivedByteCount = buffer.count
             reset()
-            return .oversized(receivedByteCount: receivedByteCount)
+            return AppendResult(
+                frameResult: .oversized(receivedByteCount: receivedByteCount),
+                timedOutPartialFrame: timedOutPartialFrame
+            )
         }
 
         let completedFrame = buffer
         let assemblyDuration = firstFragmentArrival?.duration(to: arrival).timeInterval ?? 0
         reset()
 
-        return .complete(frame: completedFrame, assemblyDuration: assemblyDuration)
+        return AppendResult(
+            frameResult: .complete(frame: completedFrame, assemblyDuration: assemblyDuration),
+            timedOutPartialFrame: timedOutPartialFrame
+        )
     }
 
     mutating func reset() {

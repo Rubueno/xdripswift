@@ -276,8 +276,21 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
     /// process value received from transmitter
     public func processValue(value: Data, sensorUID: Data) {
         let arrival = frameClock.now
+        let appendResult = frameAssembler.append(value, arrival: arrival)
 
-        switch frameAssembler.append(value, arrival: arrival) {
+        if let timedOutPartialFrame = appendResult.timedOutPartialFrame {
+            trace(
+                "Libre 2 partial frame timed out: discardedBytes=%{public}@, assemblyElapsedSeconds=%{public}@, newFragmentBytes=%{public}@",
+                log: log,
+                category: ConstantsLog.categoryCGMLibre2,
+                type: .error,
+                timedOutPartialFrame.discardedByteCount.description,
+                formatted(timedOutPartialFrame.assemblyDuration),
+                value.count.description
+            )
+        }
+
+        switch appendResult.frameResult {
         case .incomplete:
             return
 
@@ -326,6 +339,16 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
                 )
 
                 if evaluation.shouldReconnect {
+                    trace(
+                        "Libre 2 stale-frame recovery: requesting Bluetooth reconnect, sensorTime=%{public}@, reason=%{public}@, estimatedLagSeconds=%{public}@",
+                        log: log,
+                        category: ConstantsLog.categoryCGMLibre2,
+                        type: .error,
+                        sensorTimeInMinutes.description,
+                        evaluation.disposition.rawValue,
+                        formatted(evaluation.estimatedDeliveryLag)
+                    )
+
                     // `disconnect()` is serialized on the CoreBluetooth queue. The generic
                     // didDisconnect path reconnects this saved peripheral directly; it does not
                     // call Libre's manual `startScanning()` NFC workflow.
@@ -355,6 +378,16 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
             let parsedBLEData = Libre2BLEUtilities.parseBLEData(
                 decryptedFrame,
                 libre1DerivedAlgorithmParameters: isWebOOPEnabled() ? UserDefaults.standard.libre1DerivedAlgorithmParameters : nil
+            )
+
+            trace(
+                "accepted Libre 2 frame: sensorTime=%{public}@, generatedReadingCount=%{public}@, newestGeneratedTimestampSecondsSince1970=%{public}@",
+                log: log,
+                category: ConstantsLog.categoryCGMLibre2,
+                type: .info,
+                sensorTimeInMinutes.description,
+                parsedBLEData.bleGlucose.count.description,
+                formatted(parsedBLEData.bleGlucose.first?.timeStamp.timeIntervalSince1970)
             )
 
             // Deliver glucose data and sensor age to delegates on main; use local copy for inout.

@@ -4,6 +4,14 @@ import OSLog
 /// for trace
 fileprivate let log = OSLog(subsystem: ConstantsLog.subSystem, category: ConstantsLog.categoryLibre2BLEUtilities)
 
+private struct IncompleteLibre2BLEFrameError: LocalizedError {
+    let byteCount: Int
+
+    var errorDescription: String? {
+        "Decrypted Libre 2 BLE frame contains only \(byteCount) bytes"
+    }
+}
+
 /// - utilities for Libre 2 data processing, here it's for the case where data is read via bluetooth
 /// - if read via NFC or other transmitter, go to PreLibre2
 /// -  this is not the handling of bluetooth itself, this is done in class CGMLibre2Transmitter
@@ -102,6 +110,19 @@ class Libre2BLEUtilities {
         
         return result
     }
+
+    /// Reads the sensor's own minute counter before glucose parsing mutates the cached Libre history.
+    ///
+    /// The counter is the only chronology carried by a Libre 2 streaming frame. Comparing it with
+    /// frame arrival time allows the transmitter to reject a delayed frame before `parseBLEData`
+    /// stores its raw values or presents its glucose values as current.
+    static func sensorTimeInMinutes(fromDecryptedFrame data: Data) throws -> UInt16 {
+        guard data.count >= 42 else {
+            throw IncompleteLibre2BLEFrameError(byteCount: data.count)
+        }
+
+        return UInt16(data[40...41])
+    }
     
     /// - returns:
     ///     - array of GlucoseData. Returns empty array if the latest value is 0.0 for any reason
@@ -125,7 +146,8 @@ class Libre2BLEUtilities {
         // will store the temperature adjustment values, as with raw glucose values
         var temperatureAdjustmentValues = [Int](repeating: 0, count: amountOfValuesToStore)
         
-        // sensor age in minutes
+        // sensor age in minutes. The caller has already validated these bytes before allowing this
+        // frame to mutate the cached raw-value history.
         let wearTimeMinutes = UInt16(data[40...41])
         
         for i in 0 ..< 7 {

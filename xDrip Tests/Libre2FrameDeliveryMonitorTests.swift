@@ -46,6 +46,85 @@ final class Libre2FrameDeliveryMonitorTests: XCTestCase {
         XCTAssertEqual(evaluation.estimatedDeliveryLag ?? -1, 20, accuracy: 0.001)
     }
 
+    func testFrameThatBecomesStaleDuringSuspensionIsRejectedBeforeDelivery() {
+        var monitor = Libre2FrameDeliveryMonitor()
+        let start = ContinuousClock.now
+        _ = monitor.evaluate(sensorIdentifier: sensorIdentifier, sensorTimeInMinutes: 1_000, arrival: start)
+
+        let evaluation = monitor.evaluate(
+            sensorIdentifier: sensorIdentifier,
+            sensorTimeInMinutes: 1_001,
+            // Mirrors the reported trace: 271 seconds behind at arrival, then 4,773 seconds
+            // waiting for the app to resume before the frame reached application delivery.
+            arrival: start.advanced(by: .seconds(60 + 271))
+        )
+
+        XCTAssertTrue(evaluation.shouldAccept, "The frame is still eligible at CoreBluetooth arrival")
+
+        let deliveryStatus = evaluation.deliveryStatus(
+            at: start.advanced(by: .seconds(60 + 271 + 4_773))
+        )
+
+        XCTAssertFalse(deliveryStatus.shouldAccept)
+        XCTAssertEqual(deliveryStatus.processingDelay, 4_773, accuracy: 0.001)
+        XCTAssertEqual(deliveryStatus.estimatedDeliveryLag ?? -1, 5_044, accuracy: 0.001)
+    }
+
+    func testFrameDeliveredWithinRemainingFreshnessWindowIsAccepted() {
+        var monitor = Libre2FrameDeliveryMonitor()
+        let start = ContinuousClock.now
+        _ = monitor.evaluate(sensorIdentifier: sensorIdentifier, sensorTimeInMinutes: 1_000, arrival: start)
+
+        let evaluation = monitor.evaluate(
+            sensorIdentifier: sensorIdentifier,
+            sensorTimeInMinutes: 1_001,
+            arrival: start.advanced(by: .seconds(2 * 60))
+        )
+        let deliveryStatus = evaluation.deliveryStatus(
+            at: start.advanced(by: .seconds(3 * 60))
+        )
+
+        XCTAssertTrue(deliveryStatus.shouldAccept)
+        XCTAssertEqual(deliveryStatus.processingDelay, 60, accuracy: 0.001)
+        XCTAssertEqual(deliveryStatus.estimatedDeliveryLag ?? -1, 2 * 60, accuracy: 0.001)
+    }
+
+    func testNewestReadingDateIsAnchoredToArrivalChronology() {
+        var monitor = Libre2FrameDeliveryMonitor()
+        let start = ContinuousClock.now
+        _ = monitor.evaluate(sensorIdentifier: sensorIdentifier, sensorTimeInMinutes: 1_000, arrival: start)
+
+        let evaluation = monitor.evaluate(
+            sensorIdentifier: sensorIdentifier,
+            sensorTimeInMinutes: 1_001,
+            arrival: start.advanced(by: .seconds(3 * 60))
+        )
+        let frameArrivalDate = Date(timeIntervalSince1970: 10_000)
+
+        XCTAssertEqual(
+            evaluation.newestReadingDate(frameArrivalDate: frameArrivalDate),
+            frameArrivalDate.addingTimeInterval(-2 * 60)
+        )
+    }
+
+    func testNegativeRelativeLagCannotCreateFutureReadingDate() {
+        var monitor = Libre2FrameDeliveryMonitor()
+        let start = ContinuousClock.now
+        _ = monitor.evaluate(sensorIdentifier: sensorIdentifier, sensorTimeInMinutes: 1_000, arrival: start)
+
+        let evaluation = monitor.evaluate(
+            sensorIdentifier: sensorIdentifier,
+            sensorTimeInMinutes: 1_001,
+            arrival: start.advanced(by: .seconds(20))
+        )
+        let frameArrivalDate = Date(timeIntervalSince1970: 10_000)
+
+        XCTAssertEqual(
+            evaluation.newestReadingDate(frameArrivalDate: frameArrivalDate),
+            frameArrivalDate
+        )
+    }
+
     func testCumulativeSlowDeliveryEventuallyBecomesStale() {
         var monitor = Libre2FrameDeliveryMonitor()
         let start = ContinuousClock.now

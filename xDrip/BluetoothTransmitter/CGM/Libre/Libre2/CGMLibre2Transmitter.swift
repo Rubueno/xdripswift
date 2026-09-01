@@ -37,6 +37,11 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
     /// Rejects frames whose internal sensor-minute chronology has fallen behind their arrival time.
     private var frameDeliveryMonitor = Libre2FrameDeliveryMonitor()
 
+    /// Main-queue recovery latch for a frame that was current on the Bluetooth queue but became
+    /// stale while waiting for the app to resume. It is separate from the monitor's arrival latch
+    /// because this final decision is deliberately made beside parser persistence and delegates.
+    private var mainDeliveryRecoveryRequested = false
+
     /// A monotonic clock is used for delivery chronology so a wall-clock correction cannot make a
     /// current Libre frame appear stale or hide an actual delivery delay.
     private let frameClock = ContinuousClock()
@@ -242,6 +247,7 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
         let tearDown = {
             self.frameAssembler.reset()
             self.frameDeliveryMonitor.reset()
+            self.mainDeliveryRecoveryRequested = false
             self.tempSensorSerialNumber = nil
             self.libreNFC = nil
             self.libreSensorType = nil
@@ -276,6 +282,7 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
     /// process value received from transmitter
     public func processValue(value: Data, sensorUID: Data) {
         let arrival = frameClock.now
+        let frameArrivalDate = Date()
         let appendResult = frameAssembler.append(value, arrival: arrival)
 
         if let timedOutPartialFrame = appendResult.timedOutPartialFrame {
@@ -302,6 +309,7 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
                 encryptedFrame,
                 sensorUID: sensorUID,
                 arrival: arrival,
+                frameArrivalDate: frameArrivalDate,
                 assemblyDuration: assemblyDuration
             )
         }
@@ -313,6 +321,7 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
         _ encryptedFrame: Data,
         sensorUID: Data,
         arrival: ContinuousClock.Instant,
+        frameArrivalDate: Date,
         assemblyDuration: TimeInterval
     ) {
         do {
@@ -360,47 +369,128 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
 
             if evaluation.startedNewSensorTimeline {
                 trace("established Libre 2 frame-delivery timeline at sensorTime=%{public}@", log: log, category: ConstantsLog.categoryCGMLibre2, type: .info, sensorTimeInMinutes.description)
-            } else if evaluation.recoveredFromStaleDelivery {
-                trace("Libre 2 frame delivery is current again at sensorTime=%{public}@, accepting readings and resetting the recovery latch", log: log, category: ConstantsLog.categoryCGMLibre2, type: .info, sensorTimeInMinutes.description)
             }
 
-            // If web OOP is enabled, its parameters must match this sensor before parsing.
-            if isWebOOPEnabled() {
-                guard let libre1DerivedAlgorithmParameters = UserDefaults.standard.libre1DerivedAlgorithmParameters,
-                      libre1DerivedAlgorithmParameters.serialNumber == sensorSerialNumber else {
-                    trace("web oop enabled but libre1DerivedAlgorithmParameters is nil or libre1DerivedAlgorithmParameters.serialNumber != sensorSerialNumber, no further processing", log: log, category: ConstantsLog.categoryCGMLibre2, type: .info)
-                    return
-                }
-            }
-
-            // Stale frames have already returned above, so only current data can update the parser's
-            // previous-value caches or be handed to application delegates.
-            let parsedBLEData = Libre2BLEUtilities.parseBLEData(
-                decryptedFrame,
-                libre1DerivedAlgorithmParameters: isWebOOPEnabled() ? UserDefaults.standard.libre1DerivedAlgorithmParameters : nil
-            )
-
-            trace(
-                "accepted Libre 2 frame: sensorTime=%{public}@, generatedReadingCount=%{public}@, newestGeneratedTimestampSecondsSince1970=%{public}@",
-                log: log,
-                category: ConstantsLog.categoryCGMLibre2,
-                type: .info,
-                sensorTimeInMinutes.description,
-                parsedBLEData.bleGlucose.count.description,
-                formatted(parsedBLEData.bleGlucose.first?.timeStamp.timeIntervalSince1970)
-            )
-
-            // Deliver glucose data and sensor age to delegates on main; use local copy for inout.
+            // Parsing, parser-history persistence and application delegates deliberately share the
+            // main queue. The overnight production trace showed iOS suspending bt.central between
+            // the arrival check above and parseBLEData, then resuming it much later. Moving this
+            // safety boundary to the consumer queue lets us check again before any mutable parser
+            // state, chart, alert, Nightscout or AID path can observe the frame.
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
-                var copy = parsedBLEData.bleGlucose
-                self.cgmTransmitterDelegate?.cgmTransmitterInfoReceived(glucoseData: &copy, transmitterBatteryInfo: nil, sensorAge: TimeInterval(minutes: Double(parsedBLEData.sensorTimeInMinutes)))
-                self.cGMLibre2TransmitterDelegate?.received(sensorTimeInMinutes: Int(parsedBLEData.sensorTimeInMinutes), from: self)
+
+                self.processCurrentFrameOnMain(
+                    decryptedFrame,
+                    evaluation: evaluation,
+                    frameArrivalDate: frameArrivalDate
+                )
             }
 
             // TODO: add sensor start date -> userdefaults
         } catch {
             trace("in peripheral didUpdateValueFor, error while parsing/decrypting data = %{public}@", log: log, category: ConstantsLog.categoryCGMLibre2, type: .error, error.localizedDescription)
+        }
+    }
+
+    /// Performs the authoritative delivery checks on the same queue that owns parser persistence
+    /// and downstream delegates. The reading date is fixed from the original frame chronology, so
+    /// even suspension at the final instruction boundary cannot turn historical sensor data into a
+    /// newly timestamped reading.
+    private func processCurrentFrameOnMain(
+        _ decryptedFrame: Data,
+        evaluation: Libre2FrameDeliveryMonitor.Evaluation,
+        frameArrivalDate: Date
+    ) {
+        dispatchPrecondition(condition: .onQueue(.main))
+
+        let beforeParsing = evaluation.deliveryStatus(at: frameClock.now)
+        guard beforeParsing.shouldAccept else {
+            suppressFrameBeforeDelivery(evaluation: evaluation, deliveryStatus: beforeParsing, stage: "beforeParsing")
+            return
+        }
+
+        let libre1DerivedAlgorithmParameters: Libre1DerivedAlgorithmParameters?
+        if isWebOOPEnabled() {
+            guard let storedParameters = UserDefaults.standard.libre1DerivedAlgorithmParameters,
+                  storedParameters.serialNumber == sensorSerialNumber else {
+                trace("web oop enabled but libre1DerivedAlgorithmParameters is nil or libre1DerivedAlgorithmParameters.serialNumber != sensorSerialNumber, no further processing", log: log, category: ConstantsLog.categoryCGMLibre2, type: .info)
+                return
+            }
+            libre1DerivedAlgorithmParameters = storedParameters
+        } else {
+            libre1DerivedAlgorithmParameters = nil
+        }
+
+        let parsedBLEData = Libre2BLEUtilities.parseBLEData(
+            decryptedFrame,
+            libre1DerivedAlgorithmParameters: libre1DerivedAlgorithmParameters,
+            newestReadingDate: evaluation.newestReadingDate(frameArrivalDate: frameArrivalDate)
+        )
+
+        // Parsing is intentionally staged: no UserDefaults parser history has been changed yet.
+        // Repeat the check because iOS may suspend the app inside any synchronous parsing work.
+        let afterParsing = evaluation.deliveryStatus(at: frameClock.now)
+        guard afterParsing.shouldAccept else {
+            suppressFrameBeforeDelivery(evaluation: evaluation, deliveryStatus: afterParsing, stage: "afterParsing")
+            return
+        }
+
+        let recoveredBeforeDelivery = mainDeliveryRecoveryRequested || evaluation.recoveredFromStaleDelivery
+        Libre2BLEUtilities.commitRawValueHistory(from: parsedBLEData)
+        mainDeliveryRecoveryRequested = false
+
+        if recoveredBeforeDelivery {
+            trace("Libre 2 frame delivery is current again at sensorTime=%{public}@, accepting readings and resetting the recovery latch", log: log, category: ConstantsLog.categoryCGMLibre2, type: .info, evaluation.sensorTimeInMinutes.description)
+        }
+
+        trace(
+            "accepted Libre 2 frame: sensorTime=%{public}@, generatedReadingCount=%{public}@, newestGeneratedTimestampSecondsSince1970=%{public}@, processingSeconds=%{public}@, estimatedLagAtDeliverySeconds=%{public}@",
+            log: log,
+            category: ConstantsLog.categoryCGMLibre2,
+            type: .info,
+            evaluation.sensorTimeInMinutes.description,
+            parsedBLEData.bleGlucose.count.description,
+            formatted(parsedBLEData.bleGlucose.first?.timeStamp.timeIntervalSince1970),
+            formatted(afterParsing.processingDelay),
+            formatted(afterParsing.estimatedDeliveryLag)
+        )
+
+        var copy = parsedBLEData.bleGlucose
+        cgmTransmitterDelegate?.cgmTransmitterInfoReceived(glucoseData: &copy, transmitterBatteryInfo: nil, sensorAge: TimeInterval(minutes: Double(parsedBLEData.sensorTimeInMinutes)))
+        cGMLibre2TransmitterDelegate?.received(sensorTimeInMinutes: Int(parsedBLEData.sensorTimeInMinutes), from: self)
+    }
+
+    private func suppressFrameBeforeDelivery(
+        evaluation: Libre2FrameDeliveryMonitor.Evaluation,
+        deliveryStatus: Libre2FrameDeliveryMonitor.DeliveryStatus,
+        stage: String
+    ) {
+        let shouldRequestReconnect = !mainDeliveryRecoveryRequested
+        mainDeliveryRecoveryRequested = true
+
+        trace(
+            "suppressing delayed Libre 2 frame before application delivery, sensorTime=%{public}@, stage=%{public}@, processingSeconds=%{public}@, estimatedLagAtDeliverySeconds=%{public}@, requestingReconnect=%{public}@",
+            log: log,
+            category: ConstantsLog.categoryCGMLibre2,
+            type: .error,
+            evaluation.sensorTimeInMinutes.description,
+            stage,
+            formatted(deliveryStatus.processingDelay),
+            formatted(deliveryStatus.estimatedDeliveryLag),
+            shouldRequestReconnect.description
+        )
+
+        if shouldRequestReconnect {
+            trace(
+                "Libre 2 stale-frame recovery: requesting Bluetooth reconnect before application delivery, sensorTime=%{public}@, stage=%{public}@, estimatedLagSeconds=%{public}@",
+                log: log,
+                category: ConstantsLog.categoryCGMLibre2,
+                type: .error,
+                evaluation.sensorTimeInMinutes.description,
+                stage,
+                formatted(deliveryStatus.estimatedDeliveryLag)
+            )
+            disconnect()
         }
     }
 

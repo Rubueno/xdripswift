@@ -117,10 +117,39 @@ struct Libre2FrameDeliveryMonitor {
         let shouldReconnect: Bool
         let recoveredFromStaleDelivery: Bool
         let startedNewSensorTimeline: Bool
+        let arrival: ContinuousClock.Instant
 
         var shouldAccept: Bool {
             disposition == .current
         }
+
+        /// Re-evaluates the same sensor frame at the point where it is about to leave the
+        /// transmitter. iOS can suspend the app after CoreBluetooth has delivered a frame but
+        /// before parsing or main-queue delivery resumes. Adding that execution delay closes the
+        /// gap in which an initially current frame could become stale while waiting in the app.
+        func deliveryStatus(at delivery: ContinuousClock.Instant) -> DeliveryStatus {
+            let processingDelay = arrival.duration(to: delivery).timeInterval
+            let deliveryLag = estimatedDeliveryLag.map { $0 + processingDelay }
+
+            return DeliveryStatus(
+                processingDelay: processingDelay,
+                estimatedDeliveryLag: deliveryLag,
+                shouldAccept: disposition == .current
+                    && (deliveryLag ?? .greatestFiniteMagnitude) < Libre2FrameDeliveryMonitor.staleDeliveryThreshold.timeInterval
+            )
+        }
+
+        /// Anchors the newest generated reading to the frame chronology captured at arrival.
+        /// Never allow a negative relative lag to create a future reading timestamp.
+        func newestReadingDate(frameArrivalDate: Date) -> Date {
+            frameArrivalDate.addingTimeInterval(-max(estimatedDeliveryLag ?? 0, 0))
+        }
+    }
+
+    struct DeliveryStatus: Equatable {
+        let processingDelay: TimeInterval
+        let estimatedDeliveryLag: TimeInterval?
+        let shouldAccept: Bool
     }
 
     /// Five minutes is deliberately conservative. It is large enough to tolerate normal radio and
@@ -170,7 +199,8 @@ struct Libre2FrameDeliveryMonitor {
                 estimatedDeliveryLag: 0,
                 shouldReconnect: false,
                 recoveredFromStaleDelivery: false,
-                startedNewSensorTimeline: startedNewSensorTimeline
+                startedNewSensorTimeline: startedNewSensorTimeline,
+                arrival: arrival
             )
         }
 
@@ -198,7 +228,8 @@ struct Libre2FrameDeliveryMonitor {
                 estimatedDeliveryLag: nil,
                 shouldReconnect: shouldReconnect,
                 recoveredFromStaleDelivery: false,
-                startedNewSensorTimeline: false
+                startedNewSensorTimeline: false,
+                arrival: arrival
             )
         }
 
@@ -219,7 +250,8 @@ struct Libre2FrameDeliveryMonitor {
                 estimatedDeliveryLag: estimatedDeliveryLag,
                 shouldReconnect: shouldReconnect,
                 recoveredFromStaleDelivery: false,
-                startedNewSensorTimeline: false
+                startedNewSensorTimeline: false,
+                arrival: arrival
             )
         }
 
@@ -238,7 +270,8 @@ struct Libre2FrameDeliveryMonitor {
             estimatedDeliveryLag: estimatedDeliveryLag,
             shouldReconnect: false,
             recoveredFromStaleDelivery: recoveredFromStaleDelivery,
-            startedNewSensorTimeline: false
+            startedNewSensorTimeline: false,
+            arrival: arrival
         )
     }
 

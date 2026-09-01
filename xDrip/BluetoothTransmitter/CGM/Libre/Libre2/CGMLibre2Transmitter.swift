@@ -46,6 +46,23 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
     /// current Libre frame appear stale or hide an actual delivery delay.
     private let frameClock = ContinuousClock()
 
+    /// True once the streaming unlock payload has been handed to CoreBluetooth for the current
+    /// connection. The unlock count is persisted and monotonically increasing, so the payload is
+    /// sent at most once per connection even though two callbacks can trigger it.
+    private var didWriteUnlockPayloadForCurrentConnection = false
+
+    /// When the current connection was established, used only to trace how much of the sensor's
+    /// unlock window each session actually consumed.
+    private var connectedAt: ContinuousClock.Instant?
+
+    /// Serialises the no-data watchdog state below. CoreBluetooth callbacks arrive on the
+    /// transmitter's own queue while the watchdog fires on this one, so the two must not race.
+    private let noDataWatchdogQueue = DispatchQueue(label: "bt.libre2.watchdog", qos: .utility)
+
+    /// Identifies the currently armed watchdog. A rearm invalidates any previously scheduled
+    /// block, which is how a `DispatchQueue.asyncAfter` timer is cancelled.
+    private var noDataWatchdogToken = 0
+
     /// is the transmitter oop web enabled or not
     private var webOOPEnabled: Bool
     
@@ -152,9 +169,26 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
         return .nfcScanNeeded
     }
 
+    // Deliberately NOT overriding `shouldTimeoutStalledConnectionSetup()`. It would look like the
+    // right guard for a stalled Libre 2 session, but on expiry the generic path calls
+    // `stopConnectAndRestartScanning`, which calls `startScanning()` — and this class overrides
+    // that to start an NFC session. Enabling it would cancel the legitimately long pending connect
+    // (a Libre 2 only advertises about once a minute) and prompt the user to scan the sensor over
+    // and over. `armNoDataWatchdog()` below covers the same failure through `disconnect()`, which
+    // reconnects without touching the NFC workflow.
+
     override func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         super.centralManager(central, didConnect: peripheral)
-        
+
+        // a new connection needs its own unlock
+        didWriteUnlockPayloadForCurrentConnection = false
+        connectedAt = frameClock.now
+
+        // CoreBluetooth can report a connection that never delivers a single frame. Nothing else
+        // notices that: the frame delivery monitor only evaluates when a frame arrives, and the
+        // generic setup timeout is cancelled as soon as service discovery starts.
+        armNoDataWatchdog()
+
         if let sensorSerialNumber = tempSensorSerialNumber {
             // we need to send the sensorSerialNumber here. Possibly this is a new transmitter being scanned for, in which case the call to cGMLibre2TransmitterDelegate?.received(sensorSerialNumber: ..) in NFCTagReaderSessionDelegate functions wouldn't have stored the status in coredata, because it' doesn't find the transmitter, so let's store it again, at each connect, if not nil
             DispatchQueue.main.async { [weak self] in
@@ -184,7 +218,11 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
 
     override func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         super.peripheral(peripheral, didUpdateValueFor: characteristic, error: error)
-        
+
+        // any fragment proves the link is still delivering, so the silence deadline restarts here
+        // rather than only on a fully assembled frame
+        armNoDataWatchdog()
+
         // there should be already stored a value for libreSensorUID in the userdefaults at this moment, otherwise processing is not possible
         guard let libreSensorUID = UserDefaults.standard.libreSensorUID else {
             trace("in peripheral didUpdateValueFor but libreSensorUID is not known, no further processing", log: log, category: ConstantsLog.categoryCGMLibre2, type: .info)
@@ -200,54 +238,170 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
         }
     }
     
+    /// Only the two characteristics the streaming protocol uses are requested. Discovering the
+    /// whole FDE3 service costs additional GATT round trips, and every one of those is spent
+    /// inside the sensor's `libre2StreamingUnlockWindow`.
+    override func characteristicsToDiscover(for service: CBService) -> [CBUUID]? {
+        [CBUUID(string: CBUUID_WriteCharacteristic_Libre2), CBUUID(string: CBUUID_ReceiveCharacteristic_Libre2)]
+    }
+
+    override func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
+        // super assigns writeCharacteristic/receiveCharacteristic and subscribes to notifications
+        super.peripheral(peripheral, didDiscoverCharacteristicsFor: service, error: error)
+
+        // The sensor drops the link unless it is unlocked within a few seconds of connecting, so
+        // the payload must not wait for the notification-state acknowledgement: that round trip
+        // took between 1.2s and 6.8s in production traces and was what pushed most sessions past
+        // the window. CoreBluetooth transmits queued GATT operations in order, so the notification
+        // subscription issued by super still reaches the sensor before this write.
+        writeStreamingUnlockPayloadIfNeeded(trigger: "characteristic discovery")
+    }
+
     override func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
         super.peripheral(peripheral, didUpdateNotificationStateFor: characteristic, error: error)
-        
+
+        // Fallback only. The payload is normally already sent from didDiscoverCharacteristicsFor;
+        // this covers a session where that attempt could not run, for example because the write
+        // characteristic had not been discovered yet.
+        if error == nil && characteristic.isNotifying {
+            writeStreamingUnlockPayloadIfNeeded(trigger: "notification state update")
+        }
+    }
+
+    /// Sends the Libre 2 streaming unlock payload, at most once per connection.
+    ///
+    /// The unlock count is a persisted, monotonically increasing value, so it must be consumed
+    /// once per connection rather than once per callback that could plausibly send the payload.
+    private func writeStreamingUnlockPayloadIfNeeded(trigger: String) {
+        guard !didWriteUnlockPayloadForCurrentConnection else { return }
+
         // there should be already stored a value for libreSensorUID in the userdefaults at this moment, otherwise processing is not possible
         guard let libreSensorUID = UserDefaults.standard.libreSensorUID else {
-            trace("in peripheral didUpdateNotificationStateFor but libreSensorUID is not known, no further processing", log: log, category: ConstantsLog.categoryCGMLibre2, type: .info)
-            
+            trace("in writeStreamingUnlockPayloadIfNeeded but libreSensorUID is not known, no further processing", log: log, category: ConstantsLog.categoryCGMLibre2, type: .info)
+
             return
         }
-        
+
         // there should be already stored a value for librePatchInfo in the userdefaults at this moment, otherwise processing is not possible
         guard let librePatchInfo = UserDefaults.standard.librePatchInfo else {
-            trace("in peripheral didUpdateNotificationStateFor but librePatchInfo is not known, no further processing", log: log, category: ConstantsLog.categoryCGMLibre2, type: .info)
-            
+            trace("in writeStreamingUnlockPayloadIfNeeded but librePatchInfo is not known, no further processing", log: log, category: ConstantsLog.categoryCGMLibre2, type: .info)
+
             return
         }
 
         // the unlock algorithm reads 6 bytes directly, so invalid restored sensor metadata must be rejected before creating the payload
         guard libreSensorUID.count >= 6, librePatchInfo.count >= 6 else {
-            trace("in peripheral didUpdateNotificationStateFor but the stored sensor metadata is incomplete, no further processing", log: log, category: ConstantsLog.categoryCGMLibre2, type: .error)
+            trace("in writeStreamingUnlockPayloadIfNeeded but the stored sensor metadata is incomplete, no further processing", log: log, category: ConstantsLog.categoryCGMLibre2, type: .error)
 
             return
         }
-        
-        if error == nil && characteristic.isNotifying {
-            UserDefaults.standard.libreActiveSensorUnlockCount += 1
-            
-            trace("sensorid as data =  %{public}@, patchinfo = %{public}@, unlockcode = %{public}@, unlockcount = %{public}@", log: log, category: ConstantsLog.categoryCGMLibre2, type: .info, libreSensorUID.hexEncodedString(), librePatchInfo.hexEncodedString(), UserDefaults.standard.libreActiveSensorUnlockCode.description, UserDefaults.standard.libreActiveSensorUnlockCount.description)
-            
-            let unLockPayLoad = Data(Libre2BLEUtilities.streamingUnlockPayload(sensorUID: libreSensorUID, info: librePatchInfo, enableTime: UserDefaults.standard.libreActiveSensorUnlockCode, unlockCount: UserDefaults.standard.libreActiveSensorUnlockCount))
-            
-            trace("in peripheral didUpdateNotificationStateFor, writing streaming unlock payload: %{public}@", log: log, category: ConstantsLog.categoryCGMLibre2, type: .info, unLockPayLoad.hexEncodedString())
-                
-            // user may have chosen to run xDrip4iOS in parallel with other apps, in this case suppress sending unlockpayload
-            if !UserDefaults.standard.suppressUnLockPayLoad {
-                _ = writeDataToPeripheral(data: unLockPayLoad, type: .withResponse)
+
+        // user may have chosen to run xDrip4iOS in parallel with other apps, in this case suppress sending unlockpayload.
+        // the unlock count is deliberately left untouched here: nothing is sent, so nothing is consumed.
+        guard !UserDefaults.standard.suppressUnLockPayLoad else {
+            trace("in writeStreamingUnlockPayloadIfNeeded, sending the unlock payload is suppressed by the user setting, not sending it", log: log, category: ConstantsLog.categoryCGMLibre2, type: .info)
+
+            didWriteUnlockPayloadForCurrentConnection = true
+
+            return
+        }
+
+        UserDefaults.standard.libreActiveSensorUnlockCount += 1
+
+        trace("sensorid as data =  %{public}@, patchinfo = %{public}@, unlockcode = %{public}@, unlockcount = %{public}@", log: log, category: ConstantsLog.categoryCGMLibre2, type: .info, libreSensorUID.hexEncodedString(), librePatchInfo.hexEncodedString(), UserDefaults.standard.libreActiveSensorUnlockCode.description, UserDefaults.standard.libreActiveSensorUnlockCount.description)
+
+        let unLockPayLoad = Data(Libre2BLEUtilities.streamingUnlockPayload(sensorUID: libreSensorUID, info: librePatchInfo, enableTime: UserDefaults.standard.libreActiveSensorUnlockCode, unlockCount: UserDefaults.standard.libreActiveSensorUnlockCount))
+
+        let secondsSinceConnect = secondsSinceConnect()
+        let elapsedSinceConnect = formatted(secondsSinceConnect)
+
+        // A payload that leaves after the sensor's window has closed is written into a link the
+        // sensor has already given up on, and the disconnect that follows looks like it was caused
+        // by the write rather than by arriving late. Say so explicitly, so a trace shows which of
+        // the two happened without having to reconstruct the timings by hand.
+        if let secondsSinceConnect, secondsSinceConnect > ConstantsLibre.libre2StreamingUnlockWindow {
+            trace("in writeStreamingUnlockPayloadIfNeeded, writing streaming unlock payload: %{public}@, trigger = %{public}@, secondsSinceConnect = %{public}@ - this exceeds the sensor's %{public}@ second unlock window, so the sensor has probably already closed the connection", log: log, category: ConstantsLog.categoryCGMLibre2, type: .error, unLockPayLoad.hexEncodedString(), trigger, elapsedSinceConnect, ConstantsLibre.libre2StreamingUnlockWindow.description)
+        } else {
+            trace("in writeStreamingUnlockPayloadIfNeeded, writing streaming unlock payload: %{public}@, trigger = %{public}@, secondsSinceConnect = %{public}@", log: log, category: ConstantsLog.categoryCGMLibre2, type: .info, unLockPayLoad.hexEncodedString(), trigger, elapsedSinceConnect)
+        }
+
+        if writeDataToPeripheral(data: unLockPayLoad, type: .withResponse) {
+            didWriteUnlockPayloadForCurrentConnection = true
+        }
+    }
+
+    // MARK: - no-data watchdog
+
+    /// (Re)starts the no-data watchdog. Called when a connection is established and again on every
+    /// received fragment, so the deadline always measures silence rather than connection age.
+    ///
+    /// `Libre2FrameDeliveryMonitor` cannot cover this case: it is arrival driven, so a link that
+    /// delivers nothing at all never reaches it. Neither does the generic connection setup timeout,
+    /// which is cancelled once service discovery starts.
+    private func armNoDataWatchdog() {
+        noDataWatchdogQueue.async { [weak self] in
+            guard let self = self else { return }
+
+            self.noDataWatchdogToken += 1
+            let token = self.noDataWatchdogToken
+
+            self.noDataWatchdogQueue.asyncAfter(deadline: .now() + ConstantsLibre.libre2NoDataReconnectAfter) { [weak self] in
+                guard let self = self, self.noDataWatchdogToken == token else { return }
+
+                self.handleNoDataWatchdogExpiry()
             }
         }
     }
+
+    /// Stops the watchdog without arming a new one.
+    private func cancelNoDataWatchdog() {
+        noDataWatchdogQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.noDataWatchdogToken += 1
+        }
+    }
+
+    private func handleNoDataWatchdogExpiry() {
+        // If the link already went down there is nothing to recover; the generic disconnect path
+        // is reconnecting on its own.
+        guard getConnectionStatus() == .connected else { return }
+
+        trace(
+            "Libre 2 no-data watchdog: still connected but nothing received for %{public}@ seconds, forcing a reconnect",
+            log: log,
+            category: ConstantsLog.categoryCGMLibre2,
+            type: .error,
+            ConstantsLibre.libre2NoDataReconnectAfter.description
+        )
+
+        // `disconnect()` is serialised on the CoreBluetooth queue and the generic didDisconnect
+        // path reconnects the saved peripheral; it does not start Libre's manual NFC workflow.
+        disconnect()
+    }
     
+    override func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        // stop the watchdog before super runs: the reconnect it triggers will arm a fresh one from
+        // didConnect, and an expiry against a closed link has nothing to recover
+        cancelNoDataWatchdog()
+        connectedAt = nil
+        didWriteUnlockPayloadForCurrentConnection = false
+
+        super.centralManager(central, didDisconnectPeripheral: peripheral, error: error)
+    }
+
     override func prepareForRelease() {
         // Clear base CB delegates + unsubscribe common receiveCharacteristic synchronously on main
         super.prepareForRelease()
+        // the watchdog holds a weak self, but stop it here so a pending block cannot call
+        // disconnect() on a transmitter that is being torn down
+        cancelNoDataWatchdog()
         // Libre2-specific transient state cleanup
         let tearDown = {
             self.frameAssembler.reset()
             self.frameDeliveryMonitor.reset()
             self.mainDeliveryRecoveryRequested = false
+            self.didWriteUnlockPayloadForCurrentConnection = false
+            self.connectedAt = nil
             self.tempSensorSerialNumber = nil
             self.libreNFC = nil
             self.libreSensorType = nil
@@ -514,6 +668,15 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
             UserDefaults.standard.appInForeGround.description,
             evaluation.disposition.rawValue
         )
+    }
+
+    /// Seconds elapsed since the current connection was established, nil when not connected.
+    /// Traced alongside the unlock so a log shows directly how much of the sensor's
+    /// `libre2StreamingUnlockWindow` each session consumed.
+    private func secondsSinceConnect() -> TimeInterval? {
+        guard let connectedAt else { return nil }
+        let components = connectedAt.duration(to: frameClock.now).components
+        return TimeInterval(components.seconds) + TimeInterval(components.attoseconds) / 1_000_000_000_000_000_000
     }
 
     private func formatted(_ value: TimeInterval?) -> String {

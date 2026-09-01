@@ -243,6 +243,15 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
         false
     }
 
+    /// CBUUIDs to request when discovering the characteristics of `service`. Returning nil
+    /// discovers every characteristic, which costs extra GATT round trips before the connection
+    /// is usable. Subclasses that already know which characteristics they need can override this
+    /// to shorten connection setup; that matters for peripherals which close the link unless a
+    /// handshake completes within a fixed window after connecting.
+    func characteristicsToDiscover(for service: CBService) -> [CBUUID]? {
+        nil
+    }
+
     /// gets peripheral connection status, nil if peripheral not existing yet
     func getConnectionStatus() -> CBPeripheralState? {
         return peripheral?.state
@@ -807,8 +816,11 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
                 trace("in didDisconnectPeripheral, didDisconnect peripheral %{public}@ with error: %{public}@", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .error, troubleshooting: .standard(.bluetooth(.connectionFailed)), deviceName ?? "'unknown'", err.localizedDescription)
             }
         } else {
-            // Clean disconnect (rare, but handle)
-            trace("in didDisconnectPeripheral, didDisconnect peripheral with name %{public}@", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .info, troubleshooting: .detailed(.bluetooth(.disconnected)), deviceName ?? "'unknown'")
+            // Clean disconnect: CoreBluetooth reports no error, which is what a disconnect the app
+            // asked for looks like. Word it differently from the peripheralDisconnected branch
+            // above, otherwise a trace cannot show whether the peripheral dropped the link or this
+            // app closed it, and those two need very different investigation.
+            trace("in didDisconnectPeripheral, didDisconnect peripheral with name %{public}@, no error reported (local disconnect)", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .info, troubleshooting: .detailed(.bluetooth(.disconnected)), deviceName ?? "'unknown'")
         }
 
         // One-shot, subclass-requested temporary rejection (e.g., pre-auth transient on G7/ONE+)
@@ -856,7 +868,7 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
         if let services = peripheral.services {
             for service in services {
                 trace("in didDiscoverServices, call discovercharacteristics for service with uuid %{public}@", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .debug, String(describing: service.uuid))
-                peripheral.discoverCharacteristics(nil, for: service)
+                peripheral.discoverCharacteristics(characteristicsToDiscover(for: service), for: service)
             }
         } else {
             disconnect()
